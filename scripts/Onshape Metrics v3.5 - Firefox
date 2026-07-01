@@ -1,0 +1,329 @@
+// ==UserScript==
+// @name         Onshape Metrics v3.5 - Firefox
+// @namespace    http://tampermonkey.net/
+// @version      3.5
+// @description  Onshape Firefox: GPU via WebGPU API, frame time, memory. Draggable.
+// @author       Lexluthor
+// @match        *://cad.onshape.com/*
+// @match        *://*.onshape.com/*
+// @icon         https://www.onshape.com/favicon.ico
+// @grant        none
+// @run-at       document-start
+// @noframes
+// ==/UserScript==
+
+(function() {
+  'use strict';
+
+  window.OnshapeMetricsTM = {
+    samples: [],
+    isCollecting: false,
+    startTime: null,
+    frameTimings: [],
+    interactionEvents: [],
+    lastMouseDownTime: 0,
+    gpuName: 'Detectando...',
+    gpuVendor: 'Detectando...',
+
+    reset: function() {
+      this.samples = [];
+      this.startTime = null;
+      this.frameTimings = [];
+      this.interactionEvents = [];
+      console.log('[Onshape Metrics] Reset OK');
+      updateUI();
+    },
+
+    startCollecting: function() {
+      if (this.isCollecting) return;
+      this.isCollecting = true;
+      this.startTime = Date.now();
+      console.log('[Onshape Metrics] Start');
+      updateUI();
+    },
+
+    stopCollecting: function() {
+      this.isCollecting = false;
+      console.log('[Onshape Metrics] Stop');
+      updateUI();
+    },
+
+    exportCSV: function() {
+      if (this.samples.length === 0) {
+        alert('Nenhuma amostra coletada.');
+        return;
+      }
+      var header = ['timestamp','elapsed_ms','webgl_vendor','webgl_renderer','webgl_version','max_texture_size','max_renderbuffer_size','frame_time_ms','frame_jitter_ms','memory_info','interaction_latency_ms','last_interaction','fps','visibility_state','viewport_w','viewport_h','hardware_concurrency','device_memory_gb','user_agent','platform'];
+      var rows = [header.join(',')];
+      for (var i = 0; i < this.samples.length; i++) {
+        var s = this.samples[i];
+        var row = [s.timestamp, s.elapsed_ms, '"' + (s.webgl_vendor || '') + '"', '"' + (s.webgl_renderer || '') + '"', '"' + (s.webgl_version || '') + '"', s.max_texture_size || '', s.max_renderbuffer_size || '', s.frame_time_ms || '', s.frame_jitter_ms || '', '"' + (s.memory_info || '') + '"', s.interaction_latency_ms || '', s.last_interaction || '', s.fps || '', s.visibility_state || '', s.viewport_w || '', s.viewport_h || '', s.hardware_concurrency || '', s.device_memory_gb || '', '"' + (s.user_agent || '').substring(0,100) + '"', s.platform || ''];
+        rows.push(row.join(','));
+      }
+      var csv = rows.join('\n');
+      var blob = new Blob([csv], { type: 'text/csv' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'onshape_metrics_' + new Date().getTime() + '.csv';
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+  };
+
+  // CORRIGIDO: WebGPU API — mesma fonte que about:support usa no Firefox 113+
+  function detectGPUViaWebGPU() {
+    if (!navigator.gpu) {
+      console.log('[Onshape] WebGPU não disponível, usando WebGL fallback');
+      detectGPUViaWebGL();
+      return;
+    }
+    navigator.gpu.requestAdapter().then(function(adapter) {
+      if (!adapter) {
+        console.log('[Onshape] WebGPU adapter nulo, usando WebGL fallback');
+        detectGPUViaWebGL();
+        return;
+      }
+      // requestAdapterInfo disponível no Firefox 116+
+      if (adapter.requestAdapterInfo) {
+        adapter.requestAdapterInfo().then(function(info) {
+          var device = info.device || info.description || '';
+          var vendor = info.vendor || '';
+          if (device) {
+            window.OnshapeMetricsTM.gpuName = device;
+            window.OnshapeMetricsTM.gpuVendor = vendor;
+            console.log('[Onshape] GPU via WebGPU:', device, '|', vendor);
+          } else {
+            detectGPUViaWebGL();
+          }
+        }).catch(function() { detectGPUViaWebGL(); });
+      } else {
+        // Firefox mais antigo: tenta info direto no adapter
+        var label = adapter.name || adapter.label || '';
+        if (label) {
+          window.OnshapeMetricsTM.gpuName = label;
+          console.log('[Onshape] GPU via adapter.name:', label);
+        } else {
+          detectGPUViaWebGL();
+        }
+      }
+    }).catch(function() { detectGPUViaWebGL(); });
+  }
+
+  function extractGPUFromANGLE(raw) {
+    if (!raw) return raw;
+    // Formato: "ANGLE (Vendor, GPU Name Direct3D11 vs_x ps_x, D3D11-ver)"
+    var m = raw.match(/,\s*([^,]+?)\s+Direct3D/);
+    if (m) return m[1].trim();
+    // Formato sem vírgula: "ANGLE (GPU Name Direct3D11 ...)"
+    var m2 = raw.match(/\(([^(]+?)\s+Direct3D/);
+    if (m2) return m2[1].trim();
+    // Qualquer coisa antes de vs_
+    var m3 = raw.match(/([A-Za-z][\w\s]+?)\s+vs_\d/);
+    if (m3) return m3[1].trim();
+    return raw;
+  }
+
+  function detectGPUViaWebGL() {
+    try {
+      var canvas = document.createElement('canvas');
+      canvas.width = 1; canvas.height = 1;
+      var gl = canvas.getContext('webgl2') || canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+      if (!gl) return;
+      var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+      if (dbg) {
+        var raw = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
+        var vendor = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL);
+        console.log('[Onshape] ANGLE raw string:', raw);
+        var gpu = (raw && raw.indexOf('ANGLE') !== -1) ? extractGPUFromANGLE(raw) : raw;
+        window.OnshapeMetricsTM.gpuName = gpu || 'N/A';
+        window.OnshapeMetricsTM.gpuVendor = vendor || 'N/A';
+      }
+    } catch(e) {
+      console.error('[Onshape] WebGL fallback error:', e);
+    }
+  }
+
+  function getWebGLCapabilities() {
+    try {
+      var canvas = document.createElement('canvas');
+      canvas.width = 1; canvas.height = 1;
+      var gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+      if (!gl) return {};
+      return {
+        version: gl.getParameter(gl.VERSION),
+        max_texture_size: gl.getParameter(gl.MAX_TEXTURE_SIZE),
+        max_renderbuffer_size: gl.getParameter(gl.MAX_RENDERBUFFER_SIZE)
+      };
+    } catch(e) { return {}; }
+  }
+
+  // CORRIGIDO: Firefox não tem performance.memory — exibe RAM do dispositivo
+  function getMemoryInfo() {
+    // Chrome/Edge
+    if (window.performance && window.performance.memory) {
+      var mem = window.performance.memory;
+      return (mem.usedJSHeapSize / 1024 / 1024).toFixed(1) + ' MB usados / ' +
+             (mem.jsHeapSizeLimit / 1024 / 1024).toFixed(0) + ' MB limite';
+    }
+    // Firefox: performance.memory não existe — usa deviceMemory (RAM total aproximada)
+    var ram = navigator.deviceMemory;
+    if (ram) return 'RAM: ~' + ram + ' GB (Firefox — heap JS indisponível)';
+    return 'N/A (Firefox)';
+  }
+
+  function collectMetrics() {
+    if (!window.OnshapeMetricsTM.isCollecting) return;
+    try {
+      var elapsed = Date.now() - window.OnshapeMetricsTM.startTime;
+      var caps = getWebGLCapabilities();
+      var frameTime = '', frameJitter = '';
+      if (window.OnshapeMetricsTM.frameTimings.length > 0) {
+        frameTime = window.OnshapeMetricsTM.frameTimings[window.OnshapeMetricsTM.frameTimings.length - 1].toFixed(2);
+        if (window.OnshapeMetricsTM.frameTimings.length >= 2) {
+          var timings = window.OnshapeMetricsTM.frameTimings.slice(-10);
+          var mean = timings.reduce(function(a,b){return a+b;}) / timings.length;
+          var variance = timings.reduce(function(a,b){return a + Math.pow(b-mean, 2);}) / timings.length;
+          frameJitter = Math.sqrt(variance).toFixed(2);
+        }
+      }
+      var fps = (frameTime && frameTime > 0) ? (1000 / frameTime).toFixed(2) : '';
+      var interactionLatency = '';
+      if (window.OnshapeMetricsTM.interactionEvents.length > 0) {
+        interactionLatency = window.OnshapeMetricsTM.interactionEvents[window.OnshapeMetricsTM.interactionEvents.length - 1];
+      }
+      var sysInfo = {
+        hardware_concurrency: navigator.hardwareConcurrency || 'N/A',
+        device_memory_gb: navigator.deviceMemory || 'N/A',
+        user_agent: navigator.userAgent || '',
+        platform: navigator.platform || ''
+      };
+      window.OnshapeMetricsTM.samples.push({
+        timestamp: new Date().toISOString(),
+        elapsed_ms: elapsed,
+        webgl_vendor: window.OnshapeMetricsTM.gpuVendor,
+        webgl_renderer: window.OnshapeMetricsTM.gpuName,
+        webgl_version: caps.version || '',
+        max_texture_size: caps.max_texture_size || '',
+        max_renderbuffer_size: caps.max_renderbuffer_size || '',
+        frame_time_ms: frameTime,
+        frame_jitter_ms: frameJitter,
+        memory_info: getMemoryInfo(),
+        interaction_latency_ms: interactionLatency,
+        last_interaction: window.OnshapeMetricsTM.interactionEvents.length > 0 ? 'yes' : 'no',
+        fps: fps,
+        visibility_state: document.visibilityState || 'unknown',
+        viewport_w: window.innerWidth,
+        viewport_h: window.innerHeight,
+        hardware_concurrency: sysInfo.hardware_concurrency,
+        device_memory_gb: sysInfo.device_memory_gb,
+        user_agent: sysInfo.user_agent,
+        platform: sysInfo.platform
+      });
+    } catch(e) {
+      console.error('[Onshape Metrics] Error:', e);
+    }
+  }
+
+  function monitorFrameTiming() {
+    var lastTime = performance.now();
+    function tick() {
+      var now = performance.now();
+      window.OnshapeMetricsTM.frameTimings.push(now - lastTime);
+      if (window.OnshapeMetricsTM.frameTimings.length > 300) window.OnshapeMetricsTM.frameTimings.shift();
+      lastTime = now;
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  }
+
+  function monitorInteractions() {
+    document.addEventListener('mousedown', function() {
+      window.OnshapeMetricsTM.lastMouseDownTime = performance.now();
+    });
+    document.addEventListener('mousemove', function() {
+      if (window.OnshapeMetricsTM.lastMouseDownTime > 0) {
+        var latency = performance.now() - window.OnshapeMetricsTM.lastMouseDownTime;
+        window.OnshapeMetricsTM.interactionEvents.push(latency.toFixed(2));
+        if (window.OnshapeMetricsTM.interactionEvents.length > 100) window.OnshapeMetricsTM.interactionEvents.shift();
+        window.OnshapeMetricsTM.lastMouseDownTime = 0;
+      }
+    });
+  }
+
+  function makeDraggable(element, headerElement) {
+    var pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
+    headerElement.onmousedown = function(e) {
+      e = e || window.event; e.preventDefault();
+      pos3 = e.clientX; pos4 = e.clientY;
+      document.onmouseup = function() { document.onmouseup = null; document.onmousemove = null; };
+      document.onmousemove = function(e) {
+        e = e || window.event; e.preventDefault();
+        pos1 = pos3 - e.clientX; pos2 = pos4 - e.clientY;
+        pos3 = e.clientX; pos4 = e.clientY;
+        element.style.top = (element.offsetTop - pos2) + "px";
+        element.style.left = (element.offsetLeft - pos1) + "px";
+      };
+    };
+  }
+
+  function createUI() {
+    // CORRIGIDO: guard contra painel duplicado
+    if (document.getElementById('onshape-metrics-panel')) return;
+
+    var container = document.createElement('div');
+    container.id = 'onshape-metrics-panel';
+    container.style.cssText = 'position: fixed; top: 20px; right: 20px; z-index: 99999; background: rgba(0,0,0,0.95); color: #fff; padding: 0; border-radius: 8px; font-family: monospace; font-size: 11px; box-shadow: 0 0 15px rgba(0,0,0,0.8); width: 280px; height: fit-content; border: 2px solid #00BCD4;';
+
+    var header = document.createElement('div');
+    header.id = 'onshape-metrics-header';
+    header.style.cssText = 'padding: 10px 12px; background: #00BCD4; color: #000; font-weight: bold; cursor: move; user-select: none; border-bottom: 2px solid #000;';
+    header.innerHTML = '🎨 Onshape v3.5';
+
+    var content = document.createElement('div');
+    content.style.cssText = 'padding: 12px;';
+    content.innerHTML = '<div id="onshape-metrics-status" style="margin-bottom: 8px; padding: 8px; background: rgba(255,255,255,0.1); border-radius: 4px; border-left: 3px solid #00BCD4; font-size: 11px;"></div><div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 8px;"><button id="onshape-metrics-start" style="padding: 6px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 11px;">▶ Start</button><button id="onshape-metrics-stop" style="padding: 6px; background: #f44336; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 11px;">⏹ Stop</button><button id="onshape-metrics-reset" style="padding: 6px; background: #FF9800; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 11px;">🔄 Reset</button><button id="onshape-metrics-export" style="padding: 6px; background: #2196F3; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 11px;">⬇ CSV</button></div><div id="onshape-metrics-info" style="display: none; padding: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; border-left: 3px solid #00BCD4; font-size: 10px; line-height: 1.6;"></div>';
+
+    container.appendChild(header);
+    container.appendChild(content);
+    document.body.appendChild(container);
+    makeDraggable(container, header);
+
+    document.getElementById('onshape-metrics-start').onclick = function() { window.OnshapeMetricsTM.startCollecting(); };
+    document.getElementById('onshape-metrics-stop').onclick = function() { window.OnshapeMetricsTM.stopCollecting(); };
+    document.getElementById('onshape-metrics-reset').onclick = function() { window.OnshapeMetricsTM.reset(); };
+    document.getElementById('onshape-metrics-export').onclick = function() { window.OnshapeMetricsTM.exportCSV(); };
+  }
+
+  function updateUI() {
+    var status = document.getElementById('onshape-metrics-status');
+    if (status) {
+      var collecting = window.OnshapeMetricsTM.isCollecting ? '🔴 COLETANDO' : '⚫ PARADO';
+      status.innerHTML = collecting + '<br>Amostras: ' + window.OnshapeMetricsTM.samples.length + '<br>GPU: ' + window.OnshapeMetricsTM.gpuName;
+    }
+    var info = document.getElementById('onshape-metrics-info');
+    if (info) {
+      if (window.OnshapeMetricsTM.samples.length > 0) {
+        var last = window.OnshapeMetricsTM.samples[window.OnshapeMetricsTM.samples.length - 1];
+        info.innerHTML = '<strong>Última amostra:</strong><br>FPS: ' + (last.fps || 'N/A') + '<br>Frame Time: ' + (last.frame_time_ms || 'N/A') + 'ms<br>Jitter: ' + (last.frame_jitter_ms || 'N/A') + 'ms<br>Memória: ' + last.memory_info + '<br>Interaction: ' + (last.interaction_latency_ms || 'N/A') + 'ms';
+        info.style.display = 'block';
+      } else {
+        info.style.display = 'none';
+      }
+    }
+  }
+
+  window.addEventListener('load', function() {
+    setTimeout(function() {
+      createUI();
+      // Detecta GPU: WebGPU primeiro (mais preciso), fallback WebGL
+      detectGPUViaWebGPU();
+      monitorFrameTiming();
+      monitorInteractions();
+      setInterval(collectMetrics, 1000);
+      setInterval(updateUI, 500);
+      console.log('[Onshape Metrics v3.5] Ready');
+    }, 2000);
+  });
+
+})();
