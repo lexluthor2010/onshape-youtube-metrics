@@ -1,0 +1,477 @@
+// ==UserScript==
+// @name         YT Metrics v5.0 - Chromium
+// @namespace    http://tampermonkey.net/
+// @version      5.0
+// @description  YouTube Chromium: FPS, dropped frames, buffer, jitter, memoria JS, GPU + VRAM estimado. Sem innerHTML (Trusted Types fix).
+// @author       Lexluthor
+// @match        *://www.youtube.com/*
+// @match        *://youtube.com/*
+// @icon         https://www.youtube.com/favicon.ico
+// @grant        none
+// @run-at       document-end
+// ==/UserScript==
+
+// v5.0 — correcoes e melhorias sobre v4.0:
+//   1. GPU name fix: remove sufixo PCI Device ID "(0x0000128B)" da string bruta do WebGL.
+//   2. GPU Mem: usa WebGPU adapter.limits.maxBufferSize como estimativa de VRAM disponivel.
+//      (Nenhuma API web expoe VRAM usada em tempo real — so estimativa de total disponivel.)
+//   3. Largura do painel aumentada para 280px.
+//   4. Todos os fixes do v4.0 mantidos: zero innerHTML, SPA navigation, Trusted Types safe.
+
+(function() {
+  'use strict';
+
+  if (window.__YTCR5) return;
+  window.__YTCR5 = true;
+
+  // ─── ESTADO ──────────────────────────────────────────────────────────────────
+  var S = {
+    samples:        [],
+    running:        false,
+    t0:             null,
+    lastFrameCount: 0,
+    lastFrameTime:  0,
+    frameDeltas:    [],
+    gpuName:        'Detectando...',
+    gpuMem:         'Aguardando...',
+    panel:          null
+  };
+
+  // ─── HELPERS DOM (sem innerHTML — Trusted Types safe) ────────────────────────
+  function el(tag, styleStr, text) {
+    var e = document.createElement(tag);
+    if (styleStr) e.setAttribute('style', styleStr);
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  function btn(id, label, bg, onClick) {
+    var b = el('button',
+      'padding:5px 4px;background:'+bg+';color:#fff;border:none;' +
+      'border-radius:3px;cursor:pointer;font-size:11px;font-family:monospace;width:100%;');
+    b.textContent = label;
+    b.id = id;
+    b.addEventListener('click', onClick);
+    return b;
+  }
+
+  function row(parent, label, id) {
+    var line = el('div', 'margin:1px 0;');
+    var lbl  = el('span', 'color:#aaa;', label + ': ');
+    var val  = el('span', '', '\u2014');
+    val.id   = id;
+    line.appendChild(lbl);
+    line.appendChild(val);
+    parent.appendChild(line);
+    return val;
+  }
+
+  function setVal(id, value) {
+    var e = document.getElementById(id);
+    if (e) e.textContent = (value != null && value !== '') ? String(value) : '\u2014';
+  }
+
+  // ─── PARSER GPU — remove sufixo PCI Device ID ────────────────────────────────
+  // A string bruta do WebGL pode ter o formato:
+  //   "NVIDIA GeForce GT 710 (0x0000128B)"           <- sem ANGLE
+  //   "ANGLE (NVIDIA, NVIDIA GeForce GT 710 (0x0000128B) Direct3D11 ...)" <- com ANGLE Chromium
+  //
+  // O sufixo "(0x0000128B)" e o PCI Device ID da GPU — nao e util para o usuario.
+  // Este parser remove esse sufixo antes de qualquer outra operacao.
+  function parseGPUName(raw) {
+    if (!raw) return 'N/A';
+
+    // 1. Remove sufixo PCI Device ID "(0xXXXXXXXX)" em qualquer posicao
+    var clean = raw.replace(/\s*\(0x[0-9a-fA-F]+\)/g, '').trim();
+
+    if (clean.indexOf('ANGLE') === -1) {
+      // Sem ANGLE: ex "GeForce GT 710/PCIe/SSE2"
+      return clean.replace(/\/PCIe\/SSE2.*/i, '').replace(/\/SSE2.*/i, '').trim() || 'N/A';
+    }
+
+    // Formato Chromium: ANGLE (Vendor, GPU Name Direct3D11 ..., D3D11-ver)
+    var mCr = clean.match(/ANGLE\s*\(\s*[^,]+,\s*([^,]+?)\s+Direct3D/i);
+    if (mCr) return mCr[1].trim();
+
+    // Formato Firefox: ANGLE (GPU Name Direct3D11 ...)
+    var mFF = clean.match(/ANGLE\s*\(\s*(.+?)\s+Direct3D/i);
+    if (mFF) return mFF[1].trim();
+
+    // Antes de vs_ (vertex shader)
+    var mVS = clean.match(/ANGLE\s*\(\s*(.+?)\s+vs_\d/i);
+    if (mVS) return mVS[1].trim();
+
+    // Conteudo entre parenteses
+    var mP = clean.match(/ANGLE\s*\(([^)]+)\)/);
+    if (mP) return mP[1].trim();
+
+    return clean;
+  }
+
+  // ─── DETECCAO GPU via WebGL ───────────────────────────────────────────────────
+  try {
+    var _c  = document.createElement('canvas');
+    _c.width = 1; _c.height = 1;
+    var _gl = _c.getContext('webgl2') || _c.getContext('webgl');
+    if (_gl) {
+      var _dbg = _gl.getExtension('WEBGL_debug_renderer_info');
+      if (_dbg) {
+        var _raw = _gl.getParameter(_dbg.UNMASKED_RENDERER_WEBGL) || '';
+        S.gpuName = parseGPUName(_raw);
+      }
+    }
+    _c = null;
+  } catch(e) {}
+
+  // ─── DETECCAO GPU MEM via WebGPU ─────────────────────────────────────────────
+  // Nenhuma API web expoe VRAM usada em tempo real.
+  // WebGPU adapter.limits.maxBufferSize e o maximo que o driver permite alocar
+  // de uma vez — em muitas GPUs isso corresponde aproximadamente a VRAM total.
+  // Label: "X MB (WebGPU)" deixa claro que e uma estimativa de capacidade, nao uso atual.
+  function detectGPUMem() {
+    if (!navigator.gpu) {
+      S.gpuMem = 'N/D';
+      updateGPUMemDisplay();
+      return;
+    }
+    try {
+      navigator.gpu.requestAdapter().then(function(adapter) {
+        if (!adapter) { S.gpuMem = 'N/D'; updateGPUMemDisplay(); return; }
+        var limits = adapter.limits;
+        if (limits && limits.maxBufferSize && limits.maxBufferSize > 0) {
+          var mb = Math.round(limits.maxBufferSize / 1048576);
+          S.gpuMem = mb + ' MB (WebGPU)';
+        } else {
+          S.gpuMem = 'N/D';
+        }
+        updateGPUMemDisplay();
+      }).catch(function() {
+        S.gpuMem = 'N/D';
+        updateGPUMemDisplay();
+      });
+    } catch(e) {
+      S.gpuMem = 'N/D';
+      updateGPUMemDisplay();
+    }
+  }
+
+  function updateGPUMemDisplay() {
+    var panel = S.panel || document.getElementById('ytm-v5');
+    if (!panel) return;
+    if (panel._stGpuMem) panel._stGpuMem.textContent = 'GPU Mem: ' + S.gpuMem;
+    setVal('ytm-gpumem', S.gpuMem);
+  }
+
+  // ─── FRAME LOOP ───────────────────────────────────────────────────────────────
+  (function() {
+    var last = performance.now();
+    function tick() {
+      var now = performance.now();
+      S.frameDeltas.push(now - last);
+      if (S.frameDeltas.length > 300) S.frameDeltas.shift();
+      last = now;
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  })();
+
+  // ─── COLETA ───────────────────────────────────────────────────────────────────
+  function collect() {
+    if (!S.running) return;
+    var vid = document.querySelector('video');
+    if (!vid) return;
+    try {
+      var elapsed = Date.now() - S.t0;
+      var dropped = null, total = null;
+      if (typeof vid.getVideoPlaybackQuality === 'function') {
+        var q = vid.getVideoPlaybackQuality();
+        dropped = q.droppedVideoFrames; total = q.totalVideoFrames;
+      } else {
+        dropped = vid.webkitDroppedFrameCount != null ? vid.webkitDroppedFrameCount : null;
+        total   = vid.webkitDecodedFrameCount != null ? vid.webkitDecodedFrameCount : null;
+      }
+
+      var fps = null, now = Date.now();
+      if (total != null && S.lastFrameTime > 0) {
+        var fd = total - S.lastFrameCount;
+        var td = (now - S.lastFrameTime) / 1000;
+        if (td > 0) fps = (fd / td).toFixed(1);
+      }
+      S.lastFrameCount = total || 0;
+      S.lastFrameTime  = now;
+
+      var buf = 0;
+      try {
+        var bf = vid.buffered, ct = vid.currentTime || 0;
+        for (var j = 0; j < bf.length; j++) {
+          if (ct >= bf.start(j) && ct <= bf.end(j)) {
+            buf = (bf.end(j) - ct).toFixed(2); break;
+          }
+        }
+      } catch(e) {}
+
+      var ft = S.frameDeltas, jitter = '', frame_ms = '';
+      if (ft.length > 0) {
+        frame_ms = ft[ft.length - 1].toFixed(2);
+        if (ft.length >= 2) {
+          var sl = ft.slice(-10);
+          var mn = sl.reduce(function(a,b){return a+b;}) / sl.length;
+          jitter = Math.sqrt(
+            sl.reduce(function(a,b){return a+Math.pow(b-mn,2);}) / sl.length
+          ).toFixed(2);
+        }
+      }
+
+      var mem_used = '', mem_limit = '';
+      if (window.performance && window.performance.memory) {
+        mem_used  = (performance.memory.usedJSHeapSize  / 1048576).toFixed(1);
+        mem_limit = (performance.memory.jsHeapSizeLimit / 1048576).toFixed(0);
+      }
+
+      S.samples.push({
+        timestamp:       new Date().toISOString(),
+        elapsed_ms:      elapsed,
+        resolution:      (vid.videoWidth || '') + 'x' + (vid.videoHeight || ''),
+        fps:             fps,
+        droppedFrames:   dropped,
+        totalFrames:     total,
+        buffer_s:        buf,
+        jitter_ms:       jitter,
+        frame_time_ms:   frame_ms,
+        memory_used_mb:  mem_used,
+        memory_limit_mb: mem_limit,
+        gpu:             S.gpuName,
+        gpu_mem:         S.gpuMem,
+        playback_rate:   vid.playbackRate || 1,
+        paused:          vid.paused ? 'true' : 'false',
+        viewport_w:      window.innerWidth,
+        viewport_h:      window.innerHeight,
+        cores:           navigator.hardwareConcurrency || 'N/A',
+        device_ram_gb:   navigator.deviceMemory || 'N/A'
+      });
+    } catch(e) {}
+  }
+
+  // ─── CSV ─────────────────────────────────────────────────────────────────────
+  function exportCSV() {
+    if (!S.samples.length) { alert('Sem amostras.'); return; }
+    var h    = Object.keys(S.samples[0]);
+    var rows = [h.join(',')].concat(S.samples.map(function(s) {
+      return h.map(function(k) {
+        return '"' + (s[k] != null ? String(s[k]).replace(/"/g,'""') : '') + '"';
+      }).join(',');
+    }));
+    var a    = document.createElement('a');
+    a.href   = URL.createObjectURL(new Blob([rows.join('\n')], {type:'text/csv'}));
+    a.download = 'yt_metrics_' + Date.now() + '.csv';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  // ─── DRAG ─────────────────────────────────────────────────────────────────────
+  function makeDraggable(panel, handle) {
+    var p1=0, p2=0, p3=0, p4=0;
+    handle.addEventListener('mousedown', function(e) {
+      e.preventDefault();
+      p3 = e.clientX; p4 = e.clientY;
+      function onMove(e) {
+        p1 = p3 - e.clientX; p2 = p4 - e.clientY;
+        p3 = e.clientX;      p4 = e.clientY;
+        panel.style.setProperty('top',  (panel.offsetTop  - p2) + 'px', 'important');
+        panel.style.setProperty('left', (panel.offsetLeft - p1) + 'px', 'important');
+      }
+      function onUp() {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup',   onUp);
+      }
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup',   onUp);
+    });
+  }
+
+  // ─── PAINEL (100% createElement — zero innerHTML — Trusted Types safe) ────────
+  function buildPanel() {
+    var existing = document.getElementById('ytm-v5');
+    if (existing) return existing;
+
+    var anchor = document.body || document.documentElement;
+    if (!anchor) return null;
+
+    // Container principal
+    var panel = document.createElement('div');
+    panel.id = 'ytm-v5';
+    panel.setAttribute('style',
+      'position:fixed !important;bottom:20px !important;right:20px !important;' +
+      'z-index:2147483647 !important;background:rgba(0,0,0,0.95) !important;color:#eee !important;' +
+      'padding:0 !important;border-radius:8px !important;' +
+      'font-family:monospace !important;font-size:11px !important;' +
+      'width:240px !important;height:fit-content !important;border:2px solid #FFD700 !important;' +
+      'display:block !important;visibility:visible !important;opacity:1 !important;' +
+      'pointer-events:auto !important;' +
+      'box-shadow:0 0 15px rgba(0,0,0,0.8) !important;');
+
+    // Cabecalho (draggable)
+    var hdr = el('div',
+      'padding:8px 10px;background:#FFD700;color:#000;font-weight:bold;' +
+      'cursor:move;user-select:none;border-radius:6px 6px 0 0;border-bottom:2px solid #000;',
+      'YT Metrics v5.0');
+
+    // Corpo
+    var body = el('div', 'padding:10px;');
+
+    // Bloco de status
+    var stBox = el('div',
+      'margin-bottom:8px;padding:8px;background:rgba(255,255,255,0.07);' +
+      'border-radius:4px;border-left:3px solid #FFD700;line-height:1.7;');
+
+    var stDot    = el('span', 'font-size:13px;color:#666;', '\u25CF ');
+    var stState  = el('span', '', 'PARADO');
+    var stBr1    = document.createElement('br');
+    var stAml    = el('div', '', 'Amostras: 0');
+    var stMem    = el('div', '', '');
+    var stGpu    = el('div', '', 'GPU: ' + S.gpuName);
+    var stGpuMem = el('div', 'color:#FFD700;', 'GPU Mem: ' + S.gpuMem);
+
+    stBox.appendChild(stDot);
+    stBox.appendChild(stState);
+    stBox.appendChild(stBr1);
+    stBox.appendChild(stAml);
+    stBox.appendChild(stMem);
+    stBox.appendChild(stGpu);
+    stBox.appendChild(stGpuMem);
+
+    // Grade de botoes
+    var grid = el('div',
+      'display:grid;grid-template-columns:1fr 1fr;gap:3px;margin-bottom:8px;');
+    grid.appendChild(btn('ytm-start', '\u25B6 Start', '#4CAF50', function(){
+      S.running = true; S.t0 = Date.now(); renderUI();
+    }));
+    grid.appendChild(btn('ytm-stop', '\u25A0 Stop', '#f44336', function(){
+      S.running = false; renderUI();
+    }));
+    grid.appendChild(btn('ytm-reset', '\u21BA Reset', '#FF9800', function(){
+      S.samples = []; S.lastFrameCount = 0; S.lastFrameTime = 0; renderUI();
+    }));
+    grid.appendChild(btn('ytm-csv', '\u2B07 CSV', '#2196F3', exportCSV));
+
+    // Bloco de ultima amostra
+    var info = el('div',
+      'padding:8px;background:rgba(255,255,255,0.04);border-radius:4px;' +
+      'line-height:1.7;display:none;');
+    info.id = 'ytm-info';
+
+    var infoTitle = el('div',
+      'font-weight:bold;margin-bottom:4px;border-bottom:1px solid #333;padding-bottom:3px;',
+      'Ultima amostra:');
+    info.appendChild(infoTitle);
+
+    var dataBlock = el('div', '');
+    dataBlock.id = 'ytm-data';
+
+    var dataRows = [
+      ['Resolucao',  'ytm-res'],
+      ['FPS',        'ytm-fps'],
+      ['Dropped',    'ytm-drop'],
+      ['Buffer',     'ytm-buf'],
+      ['Jitter',     'ytm-jit'],
+      ['Frame Time', 'ytm-ft'],
+      ['Mem JS',     'ytm-mem'],
+      ['GPU Mem',    'ytm-gpumem'],
+      ['CPU Cores',  'ytm-cpu'],
+      ['Device RAM', 'ytm-ram']
+    ];
+    dataRows.forEach(function(r) { row(dataBlock, r[0], r[1]); });
+    info.appendChild(dataBlock);
+
+    body.appendChild(stBox);
+    body.appendChild(grid);
+    body.appendChild(info);
+    panel.appendChild(hdr);
+    panel.appendChild(body);
+    anchor.appendChild(panel);
+
+    // Referencias para renderUI
+    panel._stDot    = stDot;
+    panel._stState  = stState;
+    panel._stAml    = stAml;
+    panel._stMem    = stMem;
+    panel._stGpu    = stGpu;
+    panel._stGpuMem = stGpuMem;
+
+    makeDraggable(panel, hdr);
+    S.panel = panel;
+    return panel;
+  }
+
+  // ─── RENDER ───────────────────────────────────────────────────────────────────
+  function renderUI() {
+    var panel = S.panel || document.getElementById('ytm-v5');
+    if (!panel) return;
+
+    var dot    = panel._stDot;
+    var state  = panel._stState;
+    var aml    = panel._stAml;
+    var memEl  = panel._stMem;
+    var gpuEl  = panel._stGpu;
+    var info   = document.getElementById('ytm-info');
+
+    if (dot)   { dot.textContent = '\u25CF '; dot.style.color = S.running ? '#f44336' : '#666'; }
+    if (state) state.textContent = S.running ? 'COLETANDO' : 'PARADO';
+    if (aml)   aml.textContent = 'Amostras: ' + S.samples.length;
+    if (gpuEl) gpuEl.textContent = 'GPU: ' + S.gpuName;
+
+    if (memEl && window.performance && window.performance.memory) {
+      memEl.textContent = 'Mem JS: ' +
+        (performance.memory.usedJSHeapSize  / 1048576).toFixed(0) + '/' +
+        (performance.memory.jsHeapSizeLimit / 1048576).toFixed(0) + ' MB';
+    }
+
+    if (!info) return;
+    if (S.samples.length > 0) {
+      info.style.setProperty('display', 'block', 'important');
+      var s = S.samples[S.samples.length - 1];
+      setVal('ytm-res',    s.resolution     || '');
+      setVal('ytm-fps',    s.fps            || '');
+      setVal('ytm-drop',   s.droppedFrames  != null ? s.droppedFrames : '');
+      setVal('ytm-buf',    s.buffer_s != null ? s.buffer_s + ' s' : '');
+      setVal('ytm-jit',    s.jitter_ms      ? s.jitter_ms + ' ms' : '');
+      setVal('ytm-ft',     s.frame_time_ms  ? s.frame_time_ms + ' ms' : '');
+      setVal('ytm-mem',    s.memory_used_mb ? s.memory_used_mb + ' MB' : '');
+      setVal('ytm-gpumem', S.gpuMem);
+      setVal('ytm-cpu',    s.cores          || '');
+      setVal('ytm-ram',    s.device_ram_gb  ? s.device_ram_gb + ' GB' : '');
+    } else {
+      info.style.setProperty('display', 'none', 'important');
+    }
+  }
+
+  // ─── SOBREVIVENCIA NO SPA DO YOUTUBE ─────────────────────────────────────────
+  document.addEventListener('yt-navigate-finish', function() {
+    setTimeout(function() {
+      if (!document.getElementById('ytm-v5')) {
+        S.panel = buildPanel();
+        detectGPUMem();
+      }
+    }, 600);
+  });
+
+  setInterval(function() {
+    var p = document.getElementById('ytm-v5');
+    if (!p) {
+      S.panel = buildPanel();
+      detectGPUMem();
+    } else {
+      p.style.setProperty('display',    'block',   'important');
+      p.style.setProperty('visibility', 'visible', 'important');
+      p.style.setProperty('opacity',    '1',       'important');
+    }
+  }, 3000);
+
+  // ─── INICIO ───────────────────────────────────────────────────────────────────
+  setInterval(collect,   1000);
+  setInterval(renderUI,   500);
+
+  S.panel = buildPanel();
+  detectGPUMem();
+
+})();
